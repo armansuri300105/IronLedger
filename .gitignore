@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual environment
+venv/
+env/
+.venv/
+*/venv/
+autonomous-strategist/venv/
+
+# Node.js dependencies and build outputs
+node_modules/
+*/node_modules/
+autonomous-strategist/frontend/node_modules/
+dist/
+*/dist/
+autonomous-strategist/frontend/dist/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Secrets and local environment files
+.env
+*.env
+!.env.example
+autonomous-strategist/backend/.env
+
+# Logs and OS temporary files
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
