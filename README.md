@@ -102,7 +102,6 @@ IronLedger/
 │       │   └── index.css         # TailwindCSS v4 stylesheet
 │       ├── package.json          # Node dependencies
 │       └── vite.config.js        # Vite configuration
-├── autonomous_strategist_prompts/ # Complete step-by-step build specifications
 ├── .env.example                  # Environment configuration template
 ├── .gitignore                    # Git ignore file
 └── README.md                     # Project documentation

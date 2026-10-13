@@ -34,3 +34,7 @@ autonomous-strategist/backend/.env
 Thumbs.db
 .vscode/
 .idea/
+
+# Internal prompt specifications
+autonomous_strategist_prompts/
+
