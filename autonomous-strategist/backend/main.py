@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -35,6 +36,7 @@ from autopilot import (
     subscribe_telemetry,
     toggle_autopilot,
 )
+from buggy_monitor import format_exit_reason, infer_strategy_bias, stream_buggy_signals
 from database import Account, Position, engine, get_account, init_db
 from execution import execute_paper_order
 from graph import StrategistState, graph
@@ -46,8 +48,41 @@ from position_monitor import (
 )
 from rag_engine import retrieve_relevant_lessons
 
+# STEP 27: Persistent Session Logging to logs/session_YYYYMMDD.log
+LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs("logs", exist_ok=True)
+
+session_date = datetime.now().strftime("%Y%m%d")
+session_log_name = f"session_{session_date}.log"
+session_log_path = os.path.join(LOGS_DIR, session_log_name)
+cwd_log_path = os.path.join("logs", session_log_name)
+
+log_formatter = logging.Formatter(
+    fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+file_handler = logging.FileHandler(session_log_path, encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(log_formatter)
+
 logging.basicConfig(level=logging.INFO)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(session_log_path) for h in root_logger.handlers):
+    root_logger.addHandler(file_handler)
+
+if os.path.abspath(cwd_log_path) != os.path.abspath(session_log_path):
+    cwd_handler = logging.FileHandler(cwd_log_path, encoding="utf-8")
+    cwd_handler.setLevel(logging.INFO)
+    cwd_handler.setFormatter(log_formatter)
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(cwd_log_path) for h in root_logger.handlers):
+        root_logger.addHandler(cwd_handler)
+
 logger = logging.getLogger("autonomous_strategist_api")
+logger.info(f"Persistent session logging initialized. Active log: {session_log_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +412,10 @@ def get_portfolio():
                 "net_premium": pos.net_premium,
                 "capital_allocated": pos.capital_allocated,
                 "current_mtm": mtm_info["current_mtm"],
+                "gross_pnl": mtm_info.get("gross_pnl", unrealized),
                 "unrealized_pnl": unrealized,
+                "net_pnl": mtm_info.get("net_pnl", unrealized),
+                "estimated_charges": mtm_info.get("estimated_charges", 0.0),
                 "stop_loss": pos.stop_loss,
                 "target": pos.target,
                 "entry_timestamp": pos.entry_timestamp.isoformat() if pos.entry_timestamp else "",
@@ -425,7 +463,7 @@ def execute_trade(proposal: Dict[str, Any] = Body(...)):
 def get_positions_history():
     """
     GET /api/positions/history
-    Returns all closed trades with entry, exit, duration, and final P&L.
+    Returns all closed trades with entry, exit, duration, gross/net P&L, and charges.
     """
     with Session(engine) as session:
         statement = (
@@ -451,6 +489,8 @@ def get_positions_history():
                 "net_premium": pos.net_premium,
                 "capital_allocated": pos.capital_allocated,
                 "exit_price": pos.exit_price,
+                "gross_pnl": pos.gross_pnl if pos.gross_pnl is not None else pos.pnl,
+                "charges": pos.charges or 0.0,
                 "pnl": pos.pnl,
                 "status": pos.status,
                 "entry_timestamp": pos.entry_timestamp.isoformat() if pos.entry_timestamp else "",
@@ -489,6 +529,109 @@ def get_lessons_for_ticker(ticker: str):
         "ticker": clean_ticker,
         "lessons_markdown": lessons_markdown,
     }
+
+
+# ---------------------------------------------------------------------------
+# 7. Trading Buggy - Shadow Monitor & Signal Stream (STEP 15)
+# ---------------------------------------------------------------------------
+@app.get("/api/buggy/stream")
+async def stream_buggy():
+    """
+    GET /api/buggy/stream (STEP 15)
+    Server-Sent Events endpoint streaming real-time actionable signals (BUY_SIGNAL,
+    REVERSAL_ALERT, SELL_SIGNAL) from the Trading Buggy shadow monitor.
+    Operates in parallel without blocking LangGraph or autopilot execution.
+    """
+    return StreamingResponse(
+        stream_buggy_signals(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/buggy/overview")
+def get_buggy_overview():
+    """
+    GET /api/buggy/overview
+    Returns initial hydration data for the Trading Buggy Real-Money dashboard.
+    """
+    with Session(engine) as session:
+        # Active open positions
+        open_stmt = select(Position).where(Position.status == "OPEN")
+        open_positions = session.exec(open_stmt).all()
+
+        active_signals = []
+        for pos in open_positions:
+            legs = json.loads(pos.legs_json or "[]")
+            bias = infer_strategy_bias(pos.strategy_name, pos.legs_json)
+            strikes = [f"{l.get('strike')} {l.get('option_type')}" for l in legs]
+            lot_size = legs[0].get("lot_size", 25) if legs else 25
+            qty = legs[0].get("qty", 1) if legs else 1
+
+            active_signals.append({
+                "type": "BUY_SIGNAL",
+                "position_id": pos.id,
+                "ticker": pos.ticker,
+                "strategy_name": pos.strategy_name,
+                "bias": bias,
+                "legs": legs,
+                "strikes": strikes,
+                "recommended_entry_premium": abs(round(pos.net_premium, 2)),
+                "net_premium": round(pos.net_premium, 2),
+                "trade_type": "DEBIT" if pos.net_premium < 0 else "CREDIT",
+                "lot_size": lot_size,
+                "qty": qty,
+                "total_quantity": lot_size * qty,
+                "target": round(pos.target, 2),
+                "stop_loss": round(pos.stop_loss, 2),
+                "capital_allocated": round(pos.capital_allocated, 2),
+                "entry_spot_price": round(float(legs[0].get("strike", 0.0) if legs else 0.0), 2),
+                "entry_timestamp": pos.entry_timestamp.isoformat() if pos.entry_timestamp else "",
+                "thesis": pos.thesis,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+        # Recent completed signals (up to 15)
+        closed_stmt = (
+            select(Position)
+            .where(Position.status != "OPEN")
+            .order_by(Position.exit_timestamp.desc())
+            .limit(15)
+        )
+        closed_positions = session.exec(closed_stmt).all()
+
+        completed_signals = []
+        for pos in closed_positions:
+            reason_label = format_exit_reason(pos.status)
+            bias = infer_strategy_bias(pos.strategy_name, pos.legs_json)
+
+            completed_signals.append({
+                "type": "SELL_SIGNAL",
+                "position_id": pos.id,
+                "ticker": pos.ticker,
+                "strategy_name": pos.strategy_name,
+                "bias": bias,
+                "status": pos.status,
+                "exit_reason": reason_label,
+                "exit_price": round(pos.exit_price or 0.0, 2),
+                "pnl": round(pos.pnl or 0.0, 2),
+                "entry_timestamp": pos.entry_timestamp.isoformat() if pos.entry_timestamp else "",
+                "exit_timestamp": pos.exit_timestamp.isoformat() if pos.exit_timestamp else "",
+                "instruction": f"TRADE SIGNAL EXIT: {reason_label}. Square off your position in Demat.",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+        return {
+            "active_signals": active_signals,
+            "completed_signals": completed_signals,
+            "total_active": len(active_signals),
+            "total_completed": len(completed_signals),
+        }
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ autonomous-strategist/frontend/node_modules/
 dist/
 */dist/
 autonomous-strategist/frontend/dist/
+autonomous-strategist/backend/logs/
 .vite/
 npm-debug.log*
 yarn-debug.log*
@@ -34,6 +35,9 @@ autonomous-strategist/backend/.env
 Thumbs.db
 .vscode/
 .idea/
+*.txt
+!requirements.txt
+!*/requirements.txt
 
 # Internal prompt specifications
 autonomous_strategist_prompts/

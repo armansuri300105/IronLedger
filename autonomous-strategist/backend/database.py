@@ -52,17 +52,31 @@ class Position(SQLModel, table=True):
     entry_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     exit_timestamp: Optional[datetime] = Field(default=None)
     exit_price: Optional[float] = Field(default=None)
-    pnl: Optional[float] = Field(default=None, description="Final realized profit/loss in INR")
+    pnl: Optional[float] = Field(default=None, description="Final realized profit/loss in INR (Net PnL)")
+    gross_pnl: Optional[float] = Field(default=None, description="Gross PnL before brokerage and charges")
+    charges: Optional[float] = Field(default=0.0, description="Total Indian F&O brokerage and statutory taxes")
     status: str = Field(default="OPEN", index=True)  # OPEN, CLOSED_TARGET, CLOSED_SL, CLOSED_EXPIRY, CLOSED_MANUAL
     thesis: str = Field(default="", description="Quant Analyst original thesis")
 
 
 # ---------------------------------------------------------------------------
-# 2. Database Initialization
+# 2. Database Initialization & Helpers
 # ---------------------------------------------------------------------------
 def init_db():
-    """Initializes tables and seeds default Account if empty."""
+    """Initializes tables, applies column migrations, and seeds default Account if empty."""
     SQLModel.metadata.create_all(engine)
+    try:
+        with engine.connect() as conn:
+            res = conn.exec_driver_sql("PRAGMA table_info(position)")
+            cols = [row[1] for row in res.fetchall()]
+            if cols and "gross_pnl" not in cols:
+                conn.exec_driver_sql("ALTER TABLE position ADD COLUMN gross_pnl FLOAT")
+            if cols and "charges" not in cols:
+                conn.exec_driver_sql("ALTER TABLE position ADD COLUMN charges FLOAT DEFAULT 0.0")
+            conn.commit()
+    except Exception as exc:
+        pass
+
     with Session(engine) as session:
         statement = select(Account).where(Account.id == 1)
         account = session.exec(statement).first()
@@ -76,6 +90,24 @@ def init_db():
             )
             session.add(default_account)
             session.commit()
+
+
+def count_today_trades(session: Session, ticker: Optional[str] = None) -> int:
+    """
+    Returns the count of executed trades in the current IST trading session.
+    Used for the anti-churn 4-trade daily cap and 2-trade per symbol cap.
+    """
+    from datetime import timedelta
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(timezone.utc).astimezone(ist_tz)
+    today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_ist.astimezone(timezone.utc)
+
+    statement = select(Position).where(Position.entry_timestamp >= today_start_utc)
+    if ticker:
+        statement = statement.where(Position.ticker == ticker.strip().upper())
+    records = session.exec(statement).all()
+    return len(records)
 
 
 def get_session() -> Generator[Session, None, None]:

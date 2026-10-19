@@ -197,10 +197,10 @@ def fetch_and_index_live_news(ticker: str) -> int:
 # ---------------------------------------------------------------------------
 # 5. Query RAG Context
 # ---------------------------------------------------------------------------
-def query_rag_context(ticker: str, query: str, n_results: int = 5) -> str:
+def query_rag_context(ticker: str, query: str, n_results: int = 3) -> str:
     """
     Ensures fresh live news is indexed, queries ChromaDB, and returns
-    a formatted markdown summary of key market catalysts.
+    a formatted markdown summary limited to top 3 concise headlines (max 400 chars total).
     """
     clean_ticker = ticker.strip().upper()
     logger.info(f"Querying RAG intelligence for [{clean_ticker}]...")
@@ -217,7 +217,7 @@ def query_rag_context(ticker: str, query: str, n_results: int = 5) -> str:
             if total_count > 0:
                 results = collection.query(
                     query_texts=[query],
-                    n_results=min(n_results, total_count),
+                    n_results=min(3, total_count),
                     where={"ticker": clean_ticker},
                 )
                 if results and "documents" in results and results["documents"]:
@@ -227,23 +227,26 @@ def query_rag_context(ticker: str, query: str, n_results: int = 5) -> str:
 
     # Fallback to direct news items if vector search returned empty
     if not docs_retrieved:
-        news_items = fetch_live_news_rss(clean_ticker, max_items=n_results)
+        news_items = fetch_live_news_rss(clean_ticker, max_items=3)
         docs_retrieved = [
-            f"Headline: {item['title']} (Source: {item['source']}, Date: {item['date']})"
+            f"Headline: {item['title']}"
             for item in news_items
         ]
 
-    # Format into structured markdown
-    formatted_context = f"### Market Intelligence & News Catalysts for {clean_ticker}:\n\n"
-    for i, doc in enumerate(docs_retrieved[:n_results], 1):
-        formatted_context += f"{i}. {doc}\n\n"
+    # Format into top 3 concise headlines (max 400 chars total)
+    top_3 = docs_retrieved[:3]
+    formatted_context = f"### Market Intelligence for {clean_ticker}:\n"
+    for i, doc in enumerate(top_3, 1):
+        clean_doc = doc.replace("\n", " ").strip()
+        if len(clean_doc) > 100:
+            clean_doc = clean_doc[:97] + "..."
+        formatted_context += f"{i}. {clean_doc}\n"
 
-    formatted_context += (
-        f"**Implied Market Regime:** Recent flows indicate active range-bound option writing. "
-        f"Option pricing reflects balanced event-risk expectations across the current expiry cycle."
-    )
+    formatted_context = formatted_context.strip()
+    if len(formatted_context) > 400:
+        formatted_context = formatted_context[:397] + "..."
 
-    return formatted_context.strip()
+    return formatted_context
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +266,7 @@ def get_reflections_collection():
 def store_trade_reflection(reflection_data: Dict[str, Any]) -> bool:
     """
     Stores an agent diagnostic post-mortem in the trade_reflections ChromaDB collection.
-    Metadata includes ticker, strategy, result (WIN/LOSS), and exit reason.
+    Metadata includes ticker, strategy, result (WIN/LOSS), exit reason, and trend_state (STEP 22).
     """
     ticker = str(reflection_data.get("ticker", "GENERIC")).upper()
     strategy = str(reflection_data.get("strategy", "Option Strategy"))
@@ -271,18 +274,19 @@ def store_trade_reflection(reflection_data: Dict[str, Any]) -> bool:
     exit_reason = str(reflection_data.get("exit_reason", "MANUAL"))
     root_cause = str(reflection_data.get("root_cause", "Strategy review"))
     rule_to_remember = str(reflection_data.get("rule_to_remember", "Adhere to strict stop-loss rules."))
+    trend_state = str(reflection_data.get("trend_state", "CHOPPY_SIDEWAYS")).upper()
 
     result_type = "WIN" if pnl > 0 else "LOSS"
     timestamp = datetime.now(timezone.utc).isoformat()
 
     doc_text = (
-        f"Trade Post-Mortem [{result_type}]: {ticker} {strategy}.\n"
+        f"Trade Post-Mortem [{result_type}]: {ticker} {strategy} (Regime: {trend_state}).\n"
         f"Exit Reason: {exit_reason} with Final PnL: INR {pnl:,.2f}.\n"
         f"Root Cause: {root_cause}\n"
         f"Rule To Remember: {rule_to_remember}"
     )
 
-    doc_id = f"refl_{ticker}_{hashlib.md5(f'{timestamp}_{strategy}_{pnl}'.encode()).hexdigest()[:12]}"
+    doc_id = f"refl_{ticker}_{hashlib.md5(f'{timestamp}_{strategy}_{pnl}_{trend_state}'.encode()).hexdigest()[:12]}"
     collection = get_reflections_collection()
 
     if collection:
@@ -295,11 +299,12 @@ def store_trade_reflection(reflection_data: Dict[str, Any]) -> bool:
                     "result": result_type,
                     "pnl": pnl,
                     "exit_reason": exit_reason,
+                    "trend_state": trend_state,
                     "timestamp": timestamp,
                 }],
                 ids=[doc_id],
             )
-            logger.info(f"Stored trade reflection into ChromaDB: ID #{doc_id} ({result_type}: {ticker})")
+            logger.info(f"Stored trade reflection into ChromaDB: ID #{doc_id} ({result_type}: {ticker}, Regime: {trend_state})")
             return True
         except Exception as err:
             logger.warning(f"Failed storing reflection in ChromaDB: {err}")
@@ -307,36 +312,90 @@ def store_trade_reflection(reflection_data: Dict[str, Any]) -> bool:
     return False
 
 
-def retrieve_relevant_lessons(ticker: str, strategy_name: str, n_results: int = 3) -> str:
+def retrieve_relevant_lessons(
+    ticker: str,
+    strategy_name: str = "options strategy",
+    trend_state: Optional[str] = None,
+    n_results: int = 3,
+) -> str:
     """
     Queries trade_reflections collection using semantic similarity to retrieve
     past lessons and rules learned on this asset/strategy.
+    STEP 22: Filters by both ticker and current trend_state so rules learned in
+    choppy markets do not block valid breakout trades.
     """
+    # Backward compatibility: if 2nd arg was trend_state
+    if strategy_name in ("STRONG_UPTREND", "STRONG_DOWNTREND", "CHOPPY_SIDEWAYS") and trend_state is None:
+        trend_state = strategy_name
+        strategy_name = "options strategy"
+
     clean_ticker = ticker.strip().upper()
+    clean_trend = str(trend_state).upper() if trend_state else None
     collection = get_reflections_collection()
     query_str = f"{clean_ticker} {strategy_name} mistakes losses invalidation drawdowns"
+    if clean_trend:
+        query_str += f" {clean_trend}"
 
     lessons: List[str] = []
     if collection:
         try:
             total_count = collection.count()
             if total_count > 0:
-                results = collection.query(
-                    query_texts=[query_str],
-                    n_results=min(n_results, total_count),
-                )
-                if results and "documents" in results and results["documents"]:
-                    lessons = results["documents"][0]
+                where_clause: Optional[Dict[str, Any]] = None
+                if clean_trend:
+                    where_clause = {
+                        "$and": [
+                            {"ticker": clean_ticker},
+                            {"trend_state": clean_trend},
+                        ]
+                    }
+                else:
+                    where_clause = {"ticker": clean_ticker}
+
+                try:
+                    results = collection.query(
+                        query_texts=[query_str],
+                        n_results=min(n_results, total_count),
+                        where=where_clause,
+                    )
+                    if results and "documents" in results and results["documents"]:
+                        lessons = results["documents"][0]
+                except Exception as filter_err:
+                    logger.debug(f"ChromaDB regime-filtered query failed ({filter_err}). Retrying with ticker filter only.")
+                    try:
+                        results = collection.query(
+                            query_texts=[query_str],
+                            n_results=min(n_results, total_count),
+                            where={"ticker": clean_ticker},
+                        )
+                        if results and "documents" in results and results["documents"]:
+                            lessons = results["documents"][0]
+                    except Exception as inner_err:
+                        logger.debug(f"ChromaDB ticker query failed ({inner_err}). Retrying unfiltered.")
+
+                # Fallback to general query if empty
+                if not lessons:
+                    try:
+                        results = collection.query(
+                            query_texts=[query_str],
+                            n_results=min(n_results, total_count),
+                        )
+                        if results and "documents" in results and results["documents"]:
+                            lessons = results["documents"][0]
+                    except Exception:
+                        pass
         except Exception as err:
             logger.warning(f"Error querying trade_reflections: {err}")
 
     if not lessons:
+        regime_msg = f" for regime [{clean_trend}]" if clean_trend else ""
         return (
-            f"- No historical losses recorded yet for {clean_ticker}. Maintain baseline strict margin rules.\n"
+            f"- No historical losses recorded yet for {clean_ticker}{regime_msg}. Maintain baseline strict margin rules.\n"
             f"- Rule: Do not sell naked wings into binary corporate earnings or high IV skew regimes."
         )
 
-    formatted = f"### Historical Memory & Lessons Learned for {clean_ticker}:\n\n"
+    regime_header = f" [{clean_trend}]" if clean_trend else ""
+    formatted = f"### Historical Memory & Lessons Learned for {clean_ticker}{regime_header}:\n\n"
     for i, lesson in enumerate(lessons[:n_results], 1):
         formatted += f"{i}. {lesson.strip()}\n\n"
 

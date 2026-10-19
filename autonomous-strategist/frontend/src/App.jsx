@@ -41,6 +41,7 @@ import {
   ChevronRight,
   Flame,
 } from 'lucide-react'
+import BuggyDashboard from './BuggyDashboard'
 
 const BACKEND_URL = 'http://localhost:8000'
 
@@ -48,15 +49,6 @@ const BACKEND_URL = 'http://localhost:8000'
 const POPULAR_INSTRUMENTS = [
   { symbol: 'NIFTY', name: 'Nifty 50', category: 'INDEX', lotSize: 25 },
   { symbol: 'BANKNIFTY', name: 'Bank Nifty', category: 'INDEX', lotSize: 15 },
-  { symbol: 'FINNIFTY', name: 'Nifty Financial Services', category: 'INDEX', lotSize: 25 },
-  { symbol: 'MIDCPNIFTY', name: 'Nifty Midcap Select', category: 'INDEX', lotSize: 50 },
-  { symbol: 'RELIANCE', name: 'Reliance Industries', category: 'STOCK', lotSize: 250 },
-  { symbol: 'HDFCBANK', name: 'HDFC Bank', category: 'STOCK', lotSize: 550 },
-  { symbol: 'INFY', name: 'Infosys Ltd', category: 'STOCK', lotSize: 400 },
-  { symbol: 'TCS', name: 'Tata Consultancy Services', category: 'STOCK', lotSize: 175 },
-  { symbol: 'ICICIBANK', name: 'ICICI Bank', category: 'STOCK', lotSize: 700 },
-  { symbol: 'SBIN', name: 'State Bank of India', category: 'STOCK', lotSize: 750 },
-  { symbol: 'TATAMOTORS', name: 'Tata Motors', category: 'STOCK', lotSize: 1425 },
 ]
 
 // Safe Number Formatter (100% crash-proof against undefined, null, NaN)
@@ -131,8 +123,8 @@ function MainApp() {
     market_session: 'Open',
     ist_time: '',
     bypass_active: true,
-    watchlist: ['NIFTY', 'BANKNIFTY', 'RELIANCE', 'HDFCBANK', 'INFY'],
-    max_positions: 3,
+    watchlist: ['NIFTY', 'BANKNIFTY'],
+    max_positions: 2,
     open_positions_count: 0,
     cooldown_minutes: 30,
     cooldowns: {},
@@ -312,9 +304,13 @@ function MainApp() {
   }
 
   const fetchLessons = async (symbol = selectedTicker) => {
+    const cleanSym = (symbol || '').trim().toUpperCase()
+    if (cleanSym !== 'NIFTY' && cleanSym !== 'BANKNIFTY') {
+      return
+    }
     setIsLoadingLessons(true)
     try {
-      const res = await fetch(`${BACKEND_URL}/api/lessons/${encodeURIComponent(symbol)}`)
+      const res = await fetch(`${BACKEND_URL}/api/lessons/${encodeURIComponent(cleanSym)}`)
       if (res.ok) {
         const data = await res.json()
         setLessonsMarkdown(data.lessons_markdown || '')
@@ -329,12 +325,14 @@ function MainApp() {
   useEffect(() => {
     fetchAutopilotStatus()
     fetchPortfolio()
-    fetchLessons(selectedTicker)
+    if (selectedTicker === 'NIFTY' || selectedTicker === 'BANKNIFTY') {
+      fetchLessons(selectedTicker)
+    }
 
     const interval = setInterval(() => {
       fetchAutopilotStatus()
       fetchPortfolio()
-    }, 5000)
+    }, 10000)
 
     return () => clearInterval(interval)
   }, [selectedTicker])
@@ -505,6 +503,50 @@ function MainApp() {
   // Combined P&L calculations
   const totalNetPnl = (portfolio.realized_pnl || 0) + (portfolio.unrealized_pnl || 0)
   const returnOnCapital = ((totalNetPnl / 1000000) * 100).toFixed(2)
+
+  // STEP 25: Helper function to parse and display specific option legs
+  const renderLegs = (legsData) => {
+    if (!legsData) return <span className="text-slate-500 text-xs italic">—</span>
+
+    let legs = []
+    if (typeof legsData === 'string') {
+      try {
+        legs = JSON.parse(legsData)
+      } catch {
+        return <span className="text-slate-500 text-xs italic">—</span>
+      }
+    } else if (Array.isArray(legsData)) {
+      legs = legsData
+    }
+
+    if (!Array.isArray(legs) || legs.length === 0) {
+      return <span className="text-slate-500 text-xs italic">—</span>
+    }
+
+    return (
+      <div className="text-xs flex flex-col gap-1">
+        {legs.map((leg, idx) => {
+          const action = (leg.action || 'BUY').toUpperCase()
+          const strike = leg.strike ?? ''
+          const optionType = (leg.option_type || leg.type || '').toUpperCase()
+          const rawPrice = leg.entry_price || leg.ltp || leg.fill_price || leg.base_ltp || 0
+          const priceStr = formatINR(rawPrice)
+          const isBuy = action === 'BUY'
+
+          return (
+            <span
+              key={idx}
+              className={`font-mono font-medium whitespace-nowrap ${
+                isBuy ? 'text-green-400' : 'text-red-400'
+              }`}
+            >
+              {action} {strike} {optionType} @ ₹{priceStr}
+            </span>
+          )
+        })}
+      </div>
+    )
+  }
 
   // Pipeline Stepper Stages
   const PIPELINE_STEPS = [
@@ -773,10 +815,10 @@ function MainApp() {
         ========================================================================= */}
         <aside className="w-72 flex-shrink-0 flex flex-col border-r border-slate-800 bg-slate-900/70 p-4 backdrop-blur-md">
           {/* Navigation Tabs */}
-          <div className="grid grid-cols-3 gap-1 p-1 bg-slate-950/80 rounded-xl border border-slate-800 text-[11px] font-semibold">
+          <div className="grid grid-cols-2 gap-1.5 p-1.5 bg-slate-950/80 rounded-xl border border-slate-800 text-[11px] font-semibold">
             <button
               onClick={() => setActiveTab('mission_control')}
-              className={`flex flex-col items-center gap-1 py-2 px-1 rounded-lg transition-all ${
+              className={`flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-lg transition-all text-center ${
                 activeTab === 'mission_control'
                   ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shadow-sm'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
@@ -786,8 +828,19 @@ function MainApp() {
               <span>Autopilot</span>
             </button>
             <button
+              onClick={() => setActiveTab('buggy')}
+              className={`flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-lg transition-all text-center ${
+                activeTab === 'buggy'
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
+                  : 'text-slate-400 hover:text-amber-300 hover:bg-slate-800/40'
+              }`}
+            >
+              <Flame className="w-4 h-4 text-amber-400" />
+              <span className="font-bold">Trading Buggy (Real Money)</span>
+            </button>
+            <button
               onClick={() => setActiveTab('portfolio')}
-              className={`flex flex-col items-center gap-1 py-2 px-1 rounded-lg transition-all ${
+              className={`flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-lg transition-all text-center ${
                 activeTab === 'portfolio'
                   ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
@@ -798,7 +851,7 @@ function MainApp() {
             </button>
             <button
               onClick={() => setActiveTab('memory')}
-              className={`flex flex-col items-center gap-1 py-2 px-1 rounded-lg transition-all ${
+              className={`flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-lg transition-all text-center ${
                 activeTab === 'memory'
                   ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40 shadow-sm'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'
@@ -816,11 +869,11 @@ function MainApp() {
                 <Radio className="w-3.5 h-3.5 text-emerald-400" />
                 <span>Watchlist Radar</span>
               </span>
-              <span className="text-[10px] text-slate-500 font-mono">5 Symbols</span>
+              <span className="text-[10px] text-slate-500 font-mono">2 Symbols</span>
             </div>
 
             <div className="space-y-2 overflow-y-auto pr-1">
-              {(autopilotStatus.watchlist || ['NIFTY', 'BANKNIFTY', 'RELIANCE', 'HDFCBANK', 'INFY']).map(
+              {(autopilotStatus.watchlist || ['NIFTY', 'BANKNIFTY']).map(
                 (sym) => {
                   const isScanning = autopilotStatus.currently_scanning === sym
                   const isSelected = selectedTicker === sym
@@ -1263,6 +1316,9 @@ function MainApp() {
           </main>
         )}
 
+        {/* VIEW: TRADING BUGGY (REAL MONEY SIGNALS) */}
+        {activeTab === 'buggy' && <BuggyDashboard />}
+
         {/* VIEW 2: PAPER PORTFOLIO & VIRTUAL LEDGER */}
         {activeTab === 'portfolio' && (
           <div className="flex-1 flex flex-col p-6 overflow-y-auto space-y-6">
@@ -1302,6 +1358,7 @@ function MainApp() {
                     <tr>
                       <th className="py-2.5 px-3">Symbol</th>
                       <th className="py-2.5 px-3">Strategy</th>
+                      <th className="py-2.5 px-3">Legs / Details</th>
                       <th className="py-2.5 px-3">Capital Locked</th>
                       <th className="py-2.5 px-3">Target</th>
                       <th className="py-2.5 px-3">Stop Loss</th>
@@ -1312,7 +1369,7 @@ function MainApp() {
                   <tbody className="divide-y divide-slate-800/60">
                     {!portfolio.open_positions || portfolio.open_positions.length === 0 ? (
                       <tr>
-                        <td colSpan="7" className="text-center py-8 text-slate-600 font-sans text-xs">
+                        <td colSpan="8" className="text-center py-8 text-slate-600 font-sans text-xs">
                           No open positions currently active. Click "START AGENT" to analyze and execute an options setup.
                         </td>
                       </tr>
@@ -1321,11 +1378,14 @@ function MainApp() {
                         <tr key={pos.id} className="hover:bg-slate-900/40 transition-colors">
                           <td className="py-2.5 px-3 font-bold text-white">{pos.ticker}</td>
                           <td className="py-2.5 px-3 text-slate-300 font-sans">{pos.strategy_name}</td>
+                          <td className="py-2.5 px-3 whitespace-nowrap">
+                            {renderLegs(pos.legs)}
+                          </td>
                           <td className="py-2.5 px-3 text-cyan-300">
                             ₹{formatINR(pos.capital_allocated)}
                           </td>
-                          <td className="py-2.5 px-3 text-emerald-400">₹{formatINR(pos.target)}</td>
-                          <td className="py-2.5 px-3 text-rose-400">₹{formatINR(pos.stop_loss)}</td>
+                          <td className="py-2.5 px-3 text-emerald-400">PnL: ₹{formatINR(pos.target)}</td>
+                          <td className="py-2.5 px-3 text-rose-400">PnL: ₹{formatINR(pos.stop_loss)}</td>
                           <td className="py-2.5 px-3 font-bold">
                             <span
                               className={`px-2 py-0.5 rounded text-xs ${
@@ -1367,6 +1427,7 @@ function MainApp() {
                       <th className="py-2.5 px-3">Exit Date</th>
                       <th className="py-2.5 px-3">Symbol</th>
                       <th className="py-2.5 px-3">Strategy</th>
+                      <th className="py-2.5 px-3">Legs / Details</th>
                       <th className="py-2.5 px-3">Exit Reason</th>
                       <th className="py-2.5 px-3">Duration</th>
                       <th className="py-2.5 px-3">Final P&L</th>
@@ -1375,7 +1436,7 @@ function MainApp() {
                   <tbody className="divide-y divide-slate-800/60">
                     {history.length === 0 ? (
                       <tr>
-                        <td colSpan="6" className="text-center py-8 text-slate-600 font-sans text-xs">
+                        <td colSpan="7" className="text-center py-8 text-slate-600 font-sans text-xs">
                           No closed trades recorded yet.
                         </td>
                       </tr>
@@ -1387,6 +1448,9 @@ function MainApp() {
                           </td>
                           <td className="py-2.5 px-3 font-bold text-white">{h.ticker}</td>
                           <td className="py-2.5 px-3 text-slate-300 font-sans">{h.strategy_name}</td>
+                          <td className="py-2.5 px-3 whitespace-nowrap">
+                            {renderLegs(h.legs)}
+                          </td>
                           <td className="py-2.5 px-3">
                             <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300 border border-slate-700">
                               {h.status}
