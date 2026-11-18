@@ -43,12 +43,13 @@ import {
 } from 'lucide-react'
 import BuggyDashboard from './BuggyDashboard'
 
-const BACKEND_URL = 'http://localhost:8000'
+// Direct Backend API Server Endpoint (defaults to http://localhost:8000)
+const SERVER_URL = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
 // Curated Market Instruments for Instant Agent Launch
 const POPULAR_INSTRUMENTS = [
-  { symbol: 'NIFTY', name: 'Nifty 50', category: 'INDEX', lotSize: 25 },
-  { symbol: 'BANKNIFTY', name: 'Bank Nifty', category: 'INDEX', lotSize: 15 },
+  { symbol: 'NIFTY', name: 'Nifty 50', category: 'INDEX', lotSize: 65 },
+  { symbol: 'BANKNIFTY', name: 'Bank Nifty', category: 'INDEX', lotSize: 30 },
 ]
 
 // Safe Number Formatter (100% crash-proof against undefined, null, NaN)
@@ -195,7 +196,7 @@ function MainApp() {
           liveEventSourceRef.current.close()
         }
 
-        const es = new EventSource(`${BACKEND_URL}/api/stream/live`)
+        const es = new EventSource('/api/stream/live')
         liveEventSourceRef.current = es
 
         es.onmessage = (event) => {
@@ -265,7 +266,7 @@ function MainApp() {
   // =========================================================================
   const fetchAutopilotStatus = async () => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/autopilot/status`)
+      const res = await fetch('/api/autopilot/status')
       if (res.ok) {
         const data = await res.json()
         setAutopilotStatus((prev) => ({
@@ -283,8 +284,8 @@ function MainApp() {
   const fetchPortfolio = async () => {
     try {
       const [portRes, histRes] = await Promise.all([
-        fetch(`${BACKEND_URL}/api/portfolio`).catch(() => null),
-        fetch(`${BACKEND_URL}/api/positions/history`).catch(() => null),
+        fetch('/api/portfolio').catch(() => null),
+        fetch(`${SERVER_URL}/api/positions/history`).catch(() => null),
       ])
       if (portRes && portRes.ok) {
         const portData = await portRes.json()
@@ -310,7 +311,7 @@ function MainApp() {
     }
     setIsLoadingLessons(true)
     try {
-      const res = await fetch(`${BACKEND_URL}/api/lessons/${encodeURIComponent(cleanSym)}`)
+      const res = await fetch(`/api/lessons/${encodeURIComponent(cleanSym)}`)
       if (res.ok) {
         const data = await res.json()
         setLessonsMarkdown(data.lessons_markdown || '')
@@ -361,7 +362,7 @@ function MainApp() {
       activeAgentStreamRef.current.close()
     }
 
-    const streamUrl = `${BACKEND_URL}/api/stream/${encodeURIComponent(symbolToRun)}`
+    const streamUrl = `/api/stream/${encodeURIComponent(symbolToRun)}`
     const es = new EventSource(streamUrl)
     activeAgentStreamRef.current = es
 
@@ -452,7 +453,7 @@ function MainApp() {
   const handleToggleAutopilot = async () => {
     setIsTogglingAutopilot(true)
     try {
-      const res = await fetch(`${BACKEND_URL}/api/autopilot/toggle`, {
+      const res = await fetch('/api/autopilot/toggle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ active: !autopilotStatus.active }),
@@ -475,7 +476,7 @@ function MainApp() {
   // Manual Position Close
   const handleClosePosition = async (positionId) => {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/positions/${positionId}/close`, {
+      const res = await fetch(`/api/positions/${positionId}/close`, {
         method: 'POST',
       })
       const data = await res.json()
@@ -829,14 +830,19 @@ function MainApp() {
             </button>
             <button
               onClick={() => setActiveTab('buggy')}
-              className={`flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-lg transition-all text-center ${
+              className={`flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-lg transition-all text-center relative ${
                 activeTab === 'buggy'
-                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm shadow-amber-500/10'
                   : 'text-slate-400 hover:text-amber-300 hover:bg-slate-800/40'
               }`}
             >
-              <Flame className="w-4 h-4 text-amber-400" />
-              <span className="font-bold">Trading Buggy (Real Money)</span>
+              <div className="flex items-center gap-1">
+                <Flame className="w-4 h-4 text-amber-400" />
+                <span className="font-bold">Trading Buggy</span>
+              </div>
+              <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono">
+                Real Money
+              </span>
             </button>
             <button
               onClick={() => setActiveTab('portfolio')}
@@ -1430,46 +1436,70 @@ function MainApp() {
                       <th className="py-2.5 px-3">Legs / Details</th>
                       <th className="py-2.5 px-3">Exit Reason</th>
                       <th className="py-2.5 px-3">Duration</th>
-                      <th className="py-2.5 px-3">Final P&L</th>
+                      <th className="py-2.5 px-3">Gross P&L</th>
+                      <th className="py-2.5 px-3">Total Charges</th>
+                      <th className="py-2.5 px-3">Net Realized P&L</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60">
                     {history.length === 0 ? (
                       <tr>
-                        <td colSpan="7" className="text-center py-8 text-slate-600 font-sans text-xs">
+                        <td colSpan="9" className="text-center py-8 text-slate-600 font-sans text-xs">
                           No closed trades recorded yet.
                         </td>
                       </tr>
                     ) : (
-                      history.map((h) => (
-                        <tr key={h.id} className="hover:bg-slate-900/40 transition-colors">
-                          <td className="py-2.5 px-3 text-slate-400 text-[11px]">
-                            {h.exit_timestamp ? new Date(h.exit_timestamp).toLocaleDateString() : '—'}
-                          </td>
-                          <td className="py-2.5 px-3 font-bold text-white">{h.ticker}</td>
-                          <td className="py-2.5 px-3 text-slate-300 font-sans">{h.strategy_name}</td>
-                          <td className="py-2.5 px-3 whitespace-nowrap">
-                            {renderLegs(h.legs)}
-                          </td>
-                          <td className="py-2.5 px-3">
-                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300 border border-slate-700">
-                              {h.status}
-                            </span>
-                          </td>
-                          <td className="py-2.5 px-3 text-slate-400">{h.duration_minutes || 0} min</td>
-                          <td className="py-2.5 px-3 font-bold">
-                            <span
-                              className={`px-2 py-0.5 rounded text-xs ${
-                                (h.pnl || 0) >= 0
-                                  ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
-                                  : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
-                              }`}
-                            >
-                              {(h.pnl || 0) >= 0 ? '+' : ''}₹{formatINR(h.pnl)}
-                            </span>
-                          </td>
-                        </tr>
-                      ))
+                      history.map((h) => {
+                        const grossVal = h.gross_pnl !== null && h.gross_pnl !== undefined ? h.gross_pnl : (h.pnl ?? 0)
+                        const chargesVal = h.total_charges !== null && h.total_charges !== undefined ? h.total_charges : h.charges
+                        const netVal = h.net_pnl !== null && h.net_pnl !== undefined
+                          ? h.net_pnl
+                          : (h.pnl !== null && h.pnl !== undefined ? h.pnl : (grossVal - (chargesVal || 0)))
+
+                        return (
+                          <tr key={h.id} className="hover:bg-slate-900/40 transition-colors">
+                            <td className="py-2.5 px-3 text-slate-400 text-[11px]">
+                              {h.exit_timestamp ? new Date(h.exit_timestamp).toLocaleDateString() : '—'}
+                            </td>
+                            <td className="py-2.5 px-3 font-bold text-white">{h.ticker}</td>
+                            <td className="py-2.5 px-3 text-slate-300 font-sans">{h.strategy_name}</td>
+                            <td className="py-2.5 px-3 whitespace-nowrap">
+                              {renderLegs(h.legs)}
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300 border border-slate-700">
+                                {h.status}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3 text-slate-400">{h.duration_minutes || 0} min</td>
+                            <td className="py-2.5 px-3 font-mono font-medium">
+                              <span className={(grossVal || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                                {(grossVal || 0) >= 0 ? '+' : ''}₹{formatINR(grossVal)}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3 font-mono">
+                              {chargesVal !== null && chargesVal !== undefined && chargesVal > 0 ? (
+                                <span className="text-rose-400 font-medium">
+                                  -₹{formatINR(chargesVal)}
+                                </span>
+                              ) : (
+                                <span className="text-slate-500">-</span>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 font-bold font-mono">
+                              <span
+                                className={`px-2 py-0.5 rounded text-xs ${
+                                  (netVal || 0) >= 0
+                                    ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                                    : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
+                                }`}
+                              >
+                                {(netVal || 0) >= 0 ? '+' : ''}₹{formatINR(netVal)}
+                              </span>
+                            </td>
+                          </tr>
+                        )
+                      })
                     )}
                   </tbody>
                 </table>

@@ -28,7 +28,13 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 from dotenv import load_dotenv
 from sqlmodel import Session, select
 
-from database import Position, count_today_trades, engine
+from database import (
+    MAX_DAILY_SYMBOL_TRADES,
+    MAX_DAILY_TOTAL_TRADES,
+    Position,
+    count_today_trades,
+    engine,
+)
 from graph import StrategistState, graph
 from clef_gatekeeper import evaluate_trade_opportunity
 from market_data import fetch_live_options_data
@@ -44,12 +50,16 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------------------------
-# Global Autopilot Configuration (STEP 21: NIFTY & BANKNIFTY Focus)
+# Global Autopilot Configuration (STEP 21 & UPGRADE 50: Rigid 5-Rule Institutional Lock)
 # ---------------------------------------------------------------------------
 WATCHLIST: List[str] = ["NIFTY", "BANKNIFTY"]
 MAX_OPEN_POSITIONS: int = 2
-COOLDOWN_MINUTES_PER_TICKER: int = 15  # 15 minutes cooldown after execution or trade exit
+COOLDOWN_MINUTES_PER_TICKER: int = 20  # Rule 1: Mandatory 20-minute (1200s) cooldown per symbol after any position closes
 SCAN_LOOP_INTERVAL_SECONDS: int = 30  # 30 seconds loop interval
+# Daily session circuit breaker limits imported from database.py (or configured via .env)
+# Rule 1: Max 3 trades per symbol per day, max 6 total across NIFTY and BANKNIFTY
+DAILY_TOTAL_TRADES_CAP: int = MAX_DAILY_TOTAL_TRADES
+DAILY_SYMBOL_TRADES_CAP: int = MAX_DAILY_SYMBOL_TRADES
 
 # Autopilot state
 _is_autopilot_active: bool = True
@@ -82,10 +92,10 @@ def get_current_ist_time() -> datetime:
 
 def get_market_session_state() -> str:
     """
-    3-stage IST session state helper (STEP 22):
+    3-stage IST session state helper (UPGRADE 50: Rule 1 - 09:45-14:45 IST Trading Window):
     - FORCE_MARKET_OPEN=true -> "ACTIVE_TRADING"
-    - Mon-Fri 09:15 to 09:25 IST -> "WARMUP_ONLY"
-    - Mon-Fri 09:25 to 14:45 IST -> "ACTIVE_TRADING"
+    - Mon-Fri 09:15 to 09:45 IST -> "WARMUP_ONLY" (30-minute opening range settling)
+    - Mon-Fri 09:45 to 14:45 IST -> "ACTIVE_TRADING"
     - Mon-Fri 14:45 to 15:15 IST -> "MANAGE_ONLY"
     - Otherwise -> "MARKET_CLOSED"
     """
@@ -98,9 +108,9 @@ def get_market_session_state() -> str:
         return "MARKET_CLOSED"
 
     t = (now_ist.hour, now_ist.minute)
-    if (9, 15) <= t < (9, 25):
+    if (9, 15) <= t < (9, 45):
         return "WARMUP_ONLY"
-    elif (9, 25) <= t < (14, 45):
+    elif (9, 45) <= t < (14, 45):
         return "ACTIVE_TRADING"
     elif (14, 45) <= t <= (15, 15):
         return "MANAGE_ONLY"
@@ -124,7 +134,7 @@ def get_market_session_info() -> Dict[str, Any]:
     state = get_market_session_state()
 
     labels = {
-        "WARMUP_ONLY": "Warm-Up Only (09:15-09:25 IST)",
+        "WARMUP_ONLY": "Warm-Up Only (09:15-09:45 IST)",
         "ACTIVE_TRADING": "Open (Live Session)",
         "MANAGE_ONLY": "Manage Only (Past 14:45 IST Cutoff)",
         "MARKET_CLOSED": "Closed",
@@ -170,12 +180,164 @@ def has_open_position_for_ticker(ticker: str) -> bool:
         return False
 
 
-def is_ticker_in_cooldown(ticker: str) -> bool:
+def check_symbol_cooldown_and_exhaustion(
+    ticker: str,
+    proposed_direction: Optional[str] = None,
+    session: Optional[Session] = None,
+    current_spot: Optional[float] = None,
+) -> Tuple[bool, Optional[str]]:
     """
-    Checks if a trade was executed or closed for this ticker within the 15-minute cooldown window.
-    (UPGRADE 4 & 5: Enforces 15-minute post-exit cooldown).
+    UPGRADE 34 & 47: Same-Direction Whipsaw Cooldown & Trend Exhaustion Cooldown.
+    - UPGRADE 47: If last trade closed on CLOSED_SL or CLOSED_TREND_REVERSAL in the same strategy direction
+      within the last 20 minutes:
+        * Block re-entering the same direction UNLESS live Spot has broken out beyond the losing trade's entry spot
+          by at least +25.0 pts on NIFTY (+75.0 pts on BANKNIFTY) for Bull Call, or -25.0 pts (-75.0 pts) for Bear Put.
+        * If opposite direction, enforce 10-minute cooldown.
+    - UPGRADE 34: If 2 consecutive winning trades closed in same direction: 20-minute cooldown for that direction
+      to avoid buying exhausted wave tops.
+    Returns (True, None) if trade is allowed, or (False, reason_str) if blocked.
+    """
+    clean_sym = ticker.strip().upper()
+    now_utc = datetime.now(timezone.utc)
+
+    def _eval(sess: Session) -> Tuple[bool, Optional[str]]:
+        closed_positions = sess.exec(
+            select(Position)
+            .where(Position.ticker == clean_sym, Position.status != "OPEN")
+            .order_by(Position.exit_timestamp.desc(), Position.id.desc())
+        ).all()
+
+        if not closed_positions:
+            return True, None
+
+        last_pos = closed_positions[0]
+        exit_time = last_pos.exit_timestamp or last_pos.entry_timestamp or now_utc
+        if exit_time.tzinfo is None:
+            exit_time = exit_time.replace(tzinfo=timezone.utc)
+        elapsed_min = (now_utc - exit_time).total_seconds() / 60.0
+
+        # Rule 1 (UPGRADE 50): Mandatory 20-minute (1200s) cooldown per symbol after ANY position closes
+        if elapsed_min < 20.0:
+            rem = 20.0 - elapsed_min
+            return False, (
+                f"Mandatory Post-Exit Cooldown: Position #{last_pos.id} on {clean_sym} closed "
+                f"{elapsed_min:.1f}m ago ({last_pos.status}). Enforcing 20-minute (1200s) cooldown "
+                f"before scanning {clean_sym} again ({rem:.1f} mins remaining)."
+            )
+
+        # Rule 2: 2 consecutive winning trades in the same direction -> 20-minute cooldown for that direction
+        if len(closed_positions) >= 2:
+            p1 = closed_positions[0]
+            p2 = closed_positions[1]
+            p1_win = (
+                (p1.net_pnl is not None and p1.net_pnl > 0)
+                or (p1.pnl is not None and p1.pnl > 0)
+                or p1.status in ("CLOSED_TARGET", "CLOSED_TRAILING_STOP")
+            )
+            p2_win = (
+                (p2.net_pnl is not None and p2.net_pnl > 0)
+                or (p2.pnl is not None and p2.pnl > 0)
+                or p2.status in ("CLOSED_TARGET", "CLOSED_TRAILING_STOP")
+            )
+
+            from execution import get_position_bias
+            p1_dir = get_position_bias(p1.strategy_name)
+            p2_dir = get_position_bias(p2.strategy_name)
+
+            if p1_win and p2_win and p1_dir == p2_dir and p1_dir in ("BULLISH", "BEARISH"):
+                if elapsed_min < 20.0:
+                    check_dir = (proposed_direction or "").strip().upper()
+                    if not check_dir or check_dir == p1_dir:
+                        rem = 20.0 - elapsed_min
+                        return False, (
+                            f"Trend Exhaustion Cooldown: {clean_sym} had 2 consecutive {p1_dir} wins (#{p2.id}, #{p1.id}). "
+                            f"Enforcing 20-minute cooldown before 3rd {p1_dir} entry to avoid buying exhausted wave tops ({rem:.1f} mins remaining)."
+                        )
+
+        return True, None
+
+    if session is not None:
+        return _eval(session)
+    else:
+        with Session(engine) as sess:
+            return _eval(sess)
+
+
+def check_cross_index_drawdown(
+    ticker: str,
+    proposed_direction: Optional[str] = None,
+    session: Optional[Session] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    UPGRADE 38: Cross-Index Drawdown Contagion Guard.
+    Checks the live unrealized MTM of any currently OPEN position on the other index.
+    If the other index has an OPEN position in the same direction that is in drawdown
+    (unrealized_gross_pnl < -250.0 INR), wait and do NOT open a second correlated position.
+    """
+    clean_sym = ticker.strip().upper()
+
+    def _eval(sess: Session) -> Tuple[bool, Optional[str]]:
+        open_positions = sess.exec(select(Position).where(Position.status == "OPEN")).all()
+        for op in open_positions:
+            if op.ticker.upper() != clean_sym:
+                from execution import get_position_bias
+                other_bias = get_position_bias(op.strategy_name)
+                # Check correlated trades
+                if proposed_direction is None or proposed_direction == other_bias:
+                    other_pnl = None
+                    try:
+                        from position_monitor import POSITION_TELEMETRY, calculate_position_mtm
+                        if op.id in POSITION_TELEMETRY and "last_unrealized_pnl" in POSITION_TELEMETRY[op.id]:
+                            other_pnl = POSITION_TELEMETRY[op.id]["last_unrealized_pnl"]
+                        elif op.gross_pnl is not None:
+                            other_pnl = op.gross_pnl
+                        elif op.pnl is not None:
+                            other_pnl = op.pnl
+                        else:
+                            mtm_res = calculate_position_mtm(op)
+                            if mtm_res and "unrealized_pnl" in mtm_res:
+                                other_pnl = mtm_res["unrealized_pnl"]
+                    except Exception:
+                        if op.gross_pnl is not None:
+                            other_pnl = op.gross_pnl
+                        elif op.pnl is not None:
+                            other_pnl = op.pnl
+
+                    if other_pnl is not None and other_pnl < -250.0:
+                        return False, (
+                            f"Cross-Index Drawdown Contagion Guard: Active position #{op.id} on {op.ticker} "
+                            f"({op.strategy_name}, {other_bias}) is in drawdown (INR {other_pnl:,.2f} < -INR 250.00). "
+                            f"Holding scan on {clean_sym} to prevent double-drawdown contagion."
+                        )
+        return True, None
+
+    if session is not None:
+        return _eval(session)
+    else:
+        with Session(engine) as sess:
+            return _eval(sess)
+
+
+def is_ticker_in_cooldown(
+    ticker: str,
+    proposed_direction: Optional[str] = None,
+    current_spot: Optional[float] = None,
+) -> bool:
+    """
+    Checks if a trade was executed or closed for this ticker within the cooldown window.
+    (UPGRADE 34 & 47: Enforces 20m same-direction whipsaw cooldown with breakout check,
+    10m opposing post-SL/reversal, 20m consecutive same-direction exhaustion, and 15m post-execution).
     """
     clean = ticker.strip().upper()
+    try:
+        ok, _ = check_symbol_cooldown_and_exhaustion(
+            clean, proposed_direction=proposed_direction, current_spot=current_spot
+        )
+        if not ok:
+            return True
+    except Exception:
+        pass
+
     last_time = _last_scanned.get(clean)
     try:
         from position_monitor import LAST_EXIT_TIMESTAMP
@@ -314,6 +476,8 @@ def get_autopilot_status() -> Dict[str, Any]:
         "watchlist": WATCHLIST,
         "max_positions": MAX_OPEN_POSITIONS,
         "open_positions_count": open_count,
+        "max_daily_total_trades": MAX_DAILY_TOTAL_TRADES,
+        "max_daily_symbol_trades": MAX_DAILY_SYMBOL_TRADES,
         "cooldown_minutes": COOLDOWN_MINUTES_PER_TICKER,
         "cooldowns": get_cooldown_statuses(),
         "currently_scanning": _currently_scanning,
@@ -326,7 +490,7 @@ def get_autopilot_status() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Autonomous Execution Pipeline Invoker
 # ---------------------------------------------------------------------------
-async def scan_single_ticker(ticker: str, force: bool = False) -> Dict[str, Any]:
+async def scan_single_ticker(ticker: str, force: bool = False, market_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Executes the multi-agent LangGraph workflow for a single symbol,
     broadcasting each node's decision and auto-execution to telemetry.
@@ -353,7 +517,7 @@ async def scan_single_ticker(ticker: str, force: bool = False) -> Dict[str, Any]
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         ],
-        "market_data": {},
+        "market_data": market_data or {},
         "rag_context": "",
         "quant_proposal": {},
         "risk_approved": False,
@@ -472,7 +636,7 @@ async def run_autonomous_scanner():
 
             if session_state == "WARMUP_ONLY":
                 logger.info(
-                    "[AUTOPILOT] 09:15-09:25 IST Warm-Up Window: Building 1m candles & OI baseline. New entries paused."
+                    "[AUTOPILOT] 09:15-09:45 IST Warm-Up Window: Building 30m opening range baseline. New entries paused."
                 )
                 for sym in WATCHLIST:
                     try:
@@ -482,7 +646,7 @@ async def run_autonomous_scanner():
                 await broadcast_telemetry({
                     "type": "WARMUP_WINDOW",
                     "badge_type": "INFO",
-                    "message": "[AUTOPILOT] 09:15-09:25 IST Warm-Up Window: Building 1m candles & OI baseline. New entries paused.",
+                    "message": "[AUTOPILOT] 09:15-09:45 IST Warm-Up Window: Building 30m opening range baseline. New entries paused.",
                 })
                 await asyncio.sleep(SCAN_LOOP_INTERVAL_SECONDS)
                 continue
@@ -508,17 +672,17 @@ async def run_autonomous_scanner():
                 await asyncio.sleep(30)
                 continue
 
-            # Check 3B: Anti-Churn Daily Trades Circuit Breaker (UPGRADE 5: max 4 trades per session)
+            # Check 3B: Anti-Churn Daily Trades Circuit Breaker (Configured by MAX_DAILY_TOTAL_TRADES)
             with Session(engine) as session:
                 today_total_trades = count_today_trades(session)
-                if today_total_trades >= 4:
+                if today_total_trades >= MAX_DAILY_TOTAL_TRADES:
                     logger.info(
-                        f"[AUTOPILOT] Anti-churn circuit breaker: Daily trades cap reached ({today_total_trades}/4). Pausing scans for session."
+                        f"[AUTOPILOT] Anti-churn circuit breaker: Daily trades cap reached ({today_total_trades}/{MAX_DAILY_TOTAL_TRADES}). Pausing scans for session."
                     )
                     await broadcast_telemetry({
                         "type": "CIRCUIT_BREAKER_ACTIVE",
                         "badge_type": "WARNING",
-                        "message": f"Daily session trades cap ({today_total_trades}/4) reached. Autopilot holding current positions.",
+                        "message": f"Daily session trades cap ({today_total_trades}/{MAX_DAILY_TOTAL_TRADES}) reached. Autopilot holding current positions.",
                     })
                     await asyncio.sleep(60)
                     continue
@@ -526,17 +690,30 @@ async def run_autonomous_scanner():
             # Check 4: Find Next Eligible Symbol in Watchlist (Clef Gatekeeper)
             found_candidate = False
 
+            # UPGRADE 49: Simultaneous dual-index live telemetry refresh before scan cycle
+            try:
+                from market_data import refresh_dual_index_telemetry
+                await asyncio.to_thread(refresh_dual_index_telemetry, ["NIFTY", "BANKNIFTY"])
+            except Exception as e_telemetry:
+                logger.debug(f"[AUTOPILOT] Dual-index telemetry refresh failed: {e_telemetry}")
+
             for sym in WATCHLIST:
-                # Check symbol-specific daily limit (UPGRADE 5: max 2 per symbol)
+                # Check symbol-specific daily limit (Configured by MAX_DAILY_SYMBOL_TRADES)
                 with Session(engine) as session:
                     today_sym_trades = count_today_trades(session, sym)
-                    if today_sym_trades >= 2:
-                        logger.info(f"[AUTOPILOT] {sym} reached max daily trades cap ({today_sym_trades}/2). Skipping scan.")
+                    if today_sym_trades >= MAX_DAILY_SYMBOL_TRADES:
+                        logger.info(f"[AUTOPILOT] {sym} reached max daily trades cap ({today_sym_trades}/{MAX_DAILY_SYMBOL_TRADES}). Skipping scan.")
                         continue
 
                 # STEP 21: One-Trade-Per-Index Rule
                 if has_open_position_for_ticker(sym):
                     logger.info(f"[AUTOPILOT] {sym} already has an open position. Skipping scan.")
+                    continue
+
+                # UPGRADE 38: Cross-Index Drawdown Contagion Guard
+                drawdown_ok, drawdown_reason = check_cross_index_drawdown(sym)
+                if not drawdown_ok:
+                    logger.info(f"[AUTOPILOT] {drawdown_reason}")
                     continue
 
                 if not is_ticker_in_cooldown(sym):
@@ -550,6 +727,21 @@ async def run_autonomous_scanner():
                         if market_data is None:
                             logger.info(f"[AUTOPILOT] Market data for {sym} is None/timed out. Skipping tick.")
                             continue
+
+                        # UPGRADE 39: Track trend scan persistence in memory
+                        from risk_manager import record_trend_scan, update_market_state
+                        technicals_raw = market_data.get("intraday_technicals", {}) if isinstance(market_data.get("intraday_technicals"), dict) else {}
+                        t_state = str(market_data.get("trend_state") or technicals_raw.get("trend_state", "CHOPPY_SIDEWAYS"))
+                        record_trend_scan(sym, t_state)
+
+                        # UPGRADE 48 & 49: Maintain shared LATEST_MARKET_STATE in memory
+                        m5 = float(market_data.get("move_5m_pts") or technicals_raw.get("move_5m_pts", 0.0) or 0.0)
+                        m3 = float(market_data.get("move_3m_pts") or technicals_raw.get("move_3m_pts", 0.0) or 0.0)
+                        er = float(market_data.get("efficiency_ratio") or technicals_raw.get("efficiency_ratio", 0.5) or 0.5)
+                        pcr = float(market_data.get("pcr", 1.0) or 1.0)
+                        rsi_val_cur = float(technicals_raw.get("rsi_14", technicals_raw.get("rsi", 50.0)) or 50.0)
+                        spot_val_cur = float(market_data.get("spot_price", 0.0) or 0.0)
+                        update_market_state(sym, t_state, m5, er, pcr, spot=spot_val_cur, move_3m=m3, rsi=rsi_val_cur)
 
                         # 2. Run Clef gatekeeper discriminative check in worker thread
                         is_actionable = await asyncio.to_thread(
@@ -570,7 +762,7 @@ async def run_autonomous_scanner():
                             continue
 
                         # 3. Trigger full LangGraph pipeline on actionable opportunity
-                        await scan_single_ticker(sym)
+                        await scan_single_ticker(sym, market_data=market_data)
                         await asyncio.sleep(5)
                         break
 

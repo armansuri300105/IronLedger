@@ -38,7 +38,7 @@ from autopilot import (
 )
 from buggy_monitor import format_exit_reason, infer_strategy_bias, stream_buggy_signals
 from database import Account, Position, engine, get_account, init_db
-from execution import execute_paper_order
+from execution import execute_paper_order, get_lot_size, LOT_SIZES
 from graph import StrategistState, graph
 from position_monitor import (
     calculate_position_mtm,
@@ -253,6 +253,7 @@ async def sse_event_stream(ticker: str) -> AsyncGenerator[str, None]:
 # 4. Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/")
+@app.get("/api")
 def read_root():
     """Service metadata."""
     return {
@@ -275,6 +276,7 @@ def read_root():
 
 
 @app.get("/health")
+@app.get("/api/health")
 def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
@@ -481,6 +483,12 @@ def get_positions_history():
                     (pos.exit_timestamp - pos.entry_timestamp).total_seconds() / 60.0, 1
                 )
 
+            gross = pos.gross_pnl if pos.gross_pnl is not None else pos.pnl
+            charges_val = pos.total_charges if pos.total_charges is not None else (pos.charges or 0.0)
+            net = pos.net_pnl if pos.net_pnl is not None else pos.pnl
+            if net is None and gross is not None:
+                net = round(gross - (charges_val or 0.0), 2)
+
             history.append({
                 "id": pos.id,
                 "ticker": pos.ticker,
@@ -489,9 +497,11 @@ def get_positions_history():
                 "net_premium": pos.net_premium,
                 "capital_allocated": pos.capital_allocated,
                 "exit_price": pos.exit_price,
-                "gross_pnl": pos.gross_pnl if pos.gross_pnl is not None else pos.pnl,
-                "charges": pos.charges or 0.0,
-                "pnl": pos.pnl,
+                "gross_pnl": gross,
+                "total_charges": charges_val,
+                "charges": charges_val,
+                "net_pnl": net,
+                "pnl": net,
                 "status": pos.status,
                 "entry_timestamp": pos.entry_timestamp.isoformat() if pos.entry_timestamp else "",
                 "exit_timestamp": pos.exit_timestamp.isoformat() if pos.exit_timestamp else "",
@@ -570,7 +580,9 @@ def get_buggy_overview():
             legs = json.loads(pos.legs_json or "[]")
             bias = infer_strategy_bias(pos.strategy_name, pos.legs_json)
             strikes = [f"{l.get('strike')} {l.get('option_type')}" for l in legs]
-            lot_size = legs[0].get("lot_size", 25) if legs else 25
+            ticker_clean = (pos.ticker or "NIFTY").strip().upper()
+            fallback_lot = get_lot_size(ticker_clean)
+            lot_size = legs[0].get("lot_size", fallback_lot) if legs else fallback_lot
             qty = legs[0].get("qty", 1) if legs else 1
 
             active_signals.append({
@@ -616,6 +628,8 @@ def get_buggy_overview():
                 "ticker": pos.ticker,
                 "strategy_name": pos.strategy_name,
                 "bias": bias,
+                "legs": json.loads(pos.legs_json or "[]"),
+                "capital_allocated": round(pos.capital_allocated or 0.0, 2),
                 "status": pos.status,
                 "exit_reason": reason_label,
                 "exit_price": round(pos.exit_price or 0.0, 2),
@@ -646,4 +660,4 @@ if __name__ == "__main__":
     print(" Portfolio Endpoint: http://localhost:8000/api/portfolio")
     print(" Docs: http://localhost:8000/docs")
     print("=======================================================\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

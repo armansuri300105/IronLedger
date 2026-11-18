@@ -21,6 +21,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 from sqlmodel import Session, select
 
 from database import Position, engine
+from execution import get_lot_size, LOT_SIZES
 from market_data import fetch_live_options_data
 
 # Use Uvicorn logger for unified console visibility
@@ -152,7 +153,9 @@ async def stream_buggy_signals() -> AsyncGenerator[str, None]:
                         seen_client_open_ids.add(pos.id)
 
                         strikes_list = [f"{l.get('strike')} {l.get('option_type')}" for l in legs]
-                        lot_size = legs[0].get("lot_size", 25) if legs else 25
+                        ticker_clean = (pos.ticker or "NIFTY").strip().upper()
+                        fallback_lot = get_lot_size(ticker_clean)
+                        lot_size = legs[0].get("lot_size", fallback_lot) if legs else fallback_lot
                         qty = legs[0].get("qty", 1) if legs else 1
                         trade_type = "DEBIT" if pos.net_premium < 0 else "CREDIT"
 
@@ -282,6 +285,8 @@ async def stream_buggy_signals() -> AsyncGenerator[str, None]:
                             "position_id": pos.id,
                             "ticker": pos.ticker,
                             "strategy_name": pos.strategy_name,
+                            "legs": json.loads(pos.legs_json or "[]"),
+                            "capital_allocated": round(pos.capital_allocated or 0.0, 2),
                             "status": pos.status,
                             "exit_reason": reason_label,
                             "exit_price": round(pos.exit_price or 0.0, 2),

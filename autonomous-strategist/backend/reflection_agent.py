@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from typing import Any, Dict, Optional
 
@@ -94,7 +95,7 @@ def generate_postmortem(position: Position, trend_state: Optional[str] = None) -
     Evaluates a closed trade and generates a structured post-mortem critique.
     STEP 22: Enforces clean memory retention by persisting restrictive rules
     to ChromaDB trade_reflections ONLY when pnl < 0 and status in
-    ("CLOSED_SL", "SL_HIT", "CLOSED_TREND_REVERSAL"), tagged with trend_state.
+    ("CLOSED_SL", "SL_HIT"), tagged with trend_state.
     """
     ticker = position.ticker.upper()
     strategy = position.strategy_name
@@ -121,7 +122,12 @@ def generate_postmortem(position: Position, trend_state: Optional[str] = None) -
     system_prompt = (
         "You are the Lead Quantitative Reviewer & Post-Mortem Strategist at a proprietary options desk. "
         "Your job is to analyze completed trades, diagnose structural flaws or strengths, and derive "
-        "a single concise 'rule_to_remember' that will prevent future losses on this asset in the specified market regime."
+        "a single concise 'rule_to_remember' that will prevent future losses on this asset in the specified market regime.\n\n"
+        "CRITICAL: You MUST respond ONLY with a valid JSON object containing the exact keys:\n"
+        "- 'root_cause': string\n"
+        "- 'execution_critique': string\n"
+        "- 'rule_to_remember': string\n"
+        "Do NOT call any tools. Output valid JSON object only."
     )
 
     user_prompt = (
@@ -134,22 +140,35 @@ def generate_postmortem(position: Position, trend_state: Optional[str] = None) -
         f"- Net Entry Premium: INR {net_prem}\n"
         f"- Final Exit Price: INR {exit_price}\n"
         f"- Original Quant Thesis: {thesis}\n\n"
-        "Diagnose the root cause, critique the execution, and formulate the single golden rule_to_remember."
+        "Diagnose the root cause, critique the execution, and formulate the single golden rule_to_remember as a JSON object."
     )
 
     try:
         model_name = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-        postmortem_obj = invoke_groq_with_rotation(
+        # UPGRADE 36: Prompt-enforced JSON mode without tool-calling to prevent Groq 400 tool_use_failed errors
+        raw_resp = invoke_groq_with_rotation(
             model_name=model_name,
             temperature=0.2,
-            schema_cls=TradePostMortem,
+            schema_cls=None,
             messages=[
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt),
             ],
+            model_kwargs={"response_format": {"type": "json_object"}},
         )
-        if postmortem_obj:
-            logger.info("[GROQ POOL] Structured post-mortem successfully generated via Groq rotator.")
+        content_str = raw_resp.content if hasattr(raw_resp, "content") else str(raw_resp)
+        if isinstance(content_str, str) and content_str.strip():
+            clean_str = content_str.strip()
+            if clean_str.startswith("```"):
+                clean_str = re.sub(r"^```(?:json)?\s*", "", clean_str)
+                clean_str = re.sub(r"\s*```$", "", clean_str)
+            parsed_json = json.loads(clean_str)
+            postmortem_obj = TradePostMortem(
+                root_cause=str(parsed_json.get("root_cause", "")),
+                execution_critique=str(parsed_json.get("execution_critique", "")),
+                rule_to_remember=str(parsed_json.get("rule_to_remember", "")),
+            )
+            logger.info("[GROQ POOL] Structured post-mortem successfully generated via prompt-enforced JSON mode.")
     except Exception as exc:
         logger.warning(f"Groq rotator post-mortem generation failed ({exc}). Trying deterministic fallback...")
 
@@ -178,24 +197,85 @@ def generate_postmortem(position: Position, trend_state: Optional[str] = None) -
                 rule_to_remember=rule_to_remember,
             )
 
-    # STEP 22 & STEP 24: Enforce selective persistence to avoid ChromaDB memory pollution
-    # Never persist a ChromaDB lesson if abs(pnl) < 150.0 (ignores tiny scratch/slippage exits)
-    should_persist = (
-        (pnl < 0)
-        and (abs(pnl) >= 150.0)
-        and (status in ("CLOSED_SL", "SL_HIT", "CLOSED_TREND_REVERSAL"))
-    )
-    if should_persist:
+    # UPGRADE 32: Balanced Reinforcement Learning in ChromaDB
+    # Extract Strike Delta structure, PCR, and ER for balanced learning
+    legs = []
+    try:
+        legs = json.loads(position.legs_json or "[]")
+    except Exception:
+        pass
+
+    long_delta = 0.48
+    short_delta = 0.24
+    width = 150 if ticker == "NIFTY" else 400
+    for l in legs:
+        act = str(l.get("action", "")).upper()
+        if act == "BUY":
+            long_delta = abs(float(l.get("delta", 0.48) or 0.48))
+        elif act == "SELL":
+            short_delta = abs(float(l.get("delta", 0.24) or 0.24))
+    if len(legs) >= 2:
+        try:
+            width = abs(int(legs[0].get("strike", 0)) - int(legs[1].get("strike", 0)))
+        except Exception:
+            pass
+
+    import re
+    er_val = 0.85
+    pcr_val = 1.15
+    if thesis:
+        er_match = re.search(r"ER[:=\s]+([0-9\.]+)", thesis, re.IGNORECASE)
+        if er_match:
+            try:
+                er_val = float(er_match.group(1))
+            except Exception:
+                pass
+        pcr_match = re.search(r"PCR[:=\s]+([0-9\.]+)", thesis, re.IGNORECASE)
+        if pcr_match:
+            try:
+                pcr_val = float(pcr_match.group(1))
+            except Exception:
+                pass
+
+    is_target_win = ("TARGET" in str(status).upper()) or (pnl > 0 and status in ("CLOSED_TARGET", "TARGET_HIT"))
+    is_loss_exit = (pnl < 0) and (abs(pnl) >= 150.0) and (status in ("CLOSED_SL", "SL_HIT"))
+
+    if is_target_win:
+        blueprint_rule = (
+            f"[WINNING BLUEPRINT] {ticker} {strategy} under {regime} (PCR: {pcr_val:.2f}, ER: {er_val:.2f}). "
+            f"Structure: Long Delta {long_delta:.2f}, Short Delta {short_delta:.2f}, Width {width} pts. "
+            f"Realized Profit: INR {pnl:,.2f}. Replicate this exact strike width and delta calibration in future {regime} breakout cycles."
+        )
+        postmortem_obj.rule_to_remember = blueprint_rule
+        store_trade_reflection({
+            "ticker": ticker,
+            "strategy": strategy,
+            "pnl": pnl,
+            "exit_reason": status,
+            "root_cause": "Optimal spread delta structure and Kaufman momentum synchronization with trend continuation.",
+            "rule_to_remember": blueprint_rule,
+            "trend_state": regime,
+            "result_type": "WIN",
+        })
+        logger.info(f"Persisted [WINNING BLUEPRINT] for [{ticker}] under [{regime}] into ChromaDB.")
+    elif is_loss_exit:
+        # Avoid blanket-banning the entire regime! Tag exact entry flaw.
+        loss_flaw_rule = (
+            f"Specific Entry Flaw on {ticker} {strategy}: Avoid entering during low ER (< 0.40) or directly into major OI resistance walls. "
+            f"Do NOT ban the entire {regime} regime; confirm EMA 9/20 separation and tick velocity before re-entry."
+        )
+        postmortem_obj.rule_to_remember = loss_flaw_rule
         store_trade_reflection({
             "ticker": ticker,
             "strategy": strategy,
             "pnl": pnl,
             "exit_reason": status,
             "root_cause": postmortem_obj.root_cause,
-            "rule_to_remember": postmortem_obj.rule_to_remember,
+            "rule_to_remember": loss_flaw_rule,
             "trend_state": regime,
+            "result_type": "LOSS",
         })
-        logger.info(f"Persisted restrictive negative rule for [{ticker}] under regime [{regime}] into ChromaDB.")
+        logger.info(f"Persisted targeted entry flaw lesson for [{ticker}] under [{regime}] into ChromaDB.")
     else:
         logger.info(
             f"Skipping ChromaDB rule persistence for #{position.id} ({status}, PnL: INR {pnl:,.2f}) "

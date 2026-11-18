@@ -107,9 +107,12 @@ def invoke_groq_with_rotation(
     temperature: float = 0.2,
     schema_cls: Optional[Type[Any]] = None,
     messages: Optional[List[Any]] = None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
+    max_tokens: Optional[int] = None,
 ) -> Any:
     """
     Executes a Groq LLM call using round-robin key rotation and instant 429 failover.
+    Supports JSON mode via model_kwargs={"response_format": {"type": "json_object"}}.
     """
     rotator = GroqKeyRotator.get_instance()
     max_attempts = max(4, len(rotator.keys) * 2)
@@ -118,12 +121,16 @@ def invoke_groq_with_rotation(
     for attempt in range(1, max_attempts + 1):
         key_label, api_key = rotator.get_next_key()
         try:
-            llm = ChatGroq(
-                model=model_name,
-                temperature=temperature,
-                api_key=api_key,
-                max_retries=0,
-            )
+            llm_kwargs = {
+                "model": model_name,
+                "temperature": temperature,
+                "api_key": api_key,
+                "max_retries": 0,
+                "model_kwargs": model_kwargs or {},
+            }
+            if max_tokens is not None:
+                llm_kwargs["max_tokens"] = max_tokens
+            llm = ChatGroq(**llm_kwargs)
             target = llm.with_structured_output(schema_cls) if schema_cls else llm
             result = target.invoke(messages or [])
             logger.info(f"[GROQ POOL] Request succeeded using {key_label} (model: {model_name})")

@@ -42,3 +42,35 @@ Thumbs.db
 # Internal prompt specifications
 autonomous_strategist_prompts/
 
+# Tests, test caches & test artifacts
+.pytest_cache/
+test_*.py
+*_test.py
+tests/
+test/
+*.coverage
+.coverage
+htmlcov/
+
+# Databases, SQLite & Vector Stores
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+chroma_db/
+*/chroma_db/
+*.pickle
+*.pkl
+
+# Prompts and prompt specifications
+*prompts*/
+prompts/
+*/prompts/
+
+# Additional Logs and Temporary files
+logs/
+*/logs/
+*.tmp
+*.bak
+
+

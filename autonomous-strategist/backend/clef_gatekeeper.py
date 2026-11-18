@@ -32,9 +32,15 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 import requests
-from sqlmodel import Session
+from sqlmodel import Session, select
 
-from database import count_today_trades, engine
+from database import (
+    MAX_DAILY_SYMBOL_TRADES,
+    MAX_DAILY_TOTAL_TRADES,
+    Position,
+    count_today_trades,
+    engine,
+)
 
 # Load environment variables from backend/.env or current working directory
 dotenv_path = Path(__file__).resolve().parent / ".env"
@@ -59,6 +65,108 @@ TickSnapshot = namedtuple(
 
 # In-memory dictionary keyed by ticker storing up to 10 recent snapshots
 PREVIOUS_TICKS: Dict[str, List[TickSnapshot]] = {}
+
+
+def check_anti_chase_extension(
+    ticker: str,
+    strategy_or_bias: str,
+    spot: float,
+    ema_9: float,
+    rsi: float,
+    trend_state: str,
+    call_resistance_strike: float = 0.0,
+    put_support_strike: float = 0.0,
+    short_covering_signal: str = "",
+    atm_call_oi_change: int = 0,
+    atm_put_oi_change: int = 0,
+) -> Dict[str, Any]:
+    """
+    UPGRADE 39: Anti-Chase RSI/EMA Extension Filter & OI Support Check
+    - Bull Call Spread: RSI > 72.0 OR (Spot - EMA_9) > 35.0 pts (NIFTY) / > 95.0 pts (BANKNIFTY)
+    - Bear Put Spread: RSI < 28.0 OR (EMA_9 - Spot) > 35.0 pts (NIFTY) / > 95.0 pts (BANKNIFTY)
+    - Option-Chain OI Confirmation: Spot within 15 pts (NIFTY) / 45 pts (BANKNIFTY) of primary OI wall
+      unless actively unwinding.
+    Returns dict:
+      is_overextended: bool
+      is_near_oi_wall: bool
+      action: "BLOCK" | "DOWNGRADE" | "ALLOW"
+      downgrade_to_scout: bool
+      block_trade: bool
+      reason: str
+    """
+    clean_ticker = (ticker or "NIFTY").strip().upper()
+    strat_lower = (strategy_or_bias or "").lower()
+    clean_trend = str(trend_state or "CHOPPY_SIDEWAYS").strip().upper()
+
+    is_bullish = any(k in strat_lower for k in ["bull", "call", "uptrend"])
+    is_bearish = any(k in strat_lower for k in ["bear", "put", "downtrend"])
+    if not is_bullish and not is_bearish:
+        if clean_trend == "STRONG_UPTREND":
+            is_bullish = True
+        elif clean_trend == "STRONG_DOWNTREND":
+            is_bearish = True
+
+    ext_threshold = 35.0 if clean_ticker == "NIFTY" else 95.0
+    wall_dist_threshold = 15.0 if clean_ticker == "NIFTY" else 45.0
+
+    is_overextended = False
+    is_near_oi_wall = False
+    ext_reasons = []
+
+    if is_bullish:
+        if rsi > 72.0:
+            is_overextended = True
+            ext_reasons.append(f"RSI={rsi:.1f} > 72.0")
+        if ema_9 > 0 and (spot - ema_9) > ext_threshold:
+            is_overextended = True
+            ext_reasons.append(f"Spot - EMA_9 = {spot - ema_9:.1f} > {ext_threshold:.1f} pts")
+
+        # Near primary Call Resistance Wall
+        call_wall = float(call_resistance_strike or 0.0)
+        call_unwinding = (short_covering_signal == "BULLISH_CALL_UNWINDING") or (atm_call_oi_change < 0)
+        if call_wall > 0 and abs(call_wall - spot) <= wall_dist_threshold and not call_unwinding:
+            is_near_oi_wall = True
+            ext_reasons.append(f"Spot {spot:.1f} within {wall_dist_threshold} pts of Call Wall {call_wall:.0f} without unwinding")
+
+    elif is_bearish:
+        if rsi < 28.0:
+            is_overextended = True
+            ext_reasons.append(f"RSI={rsi:.1f} < 28.0")
+        if ema_9 > 0 and (ema_9 - spot) > ext_threshold:
+            is_overextended = True
+            ext_reasons.append(f"EMA_9 - Spot = {ema_9 - spot:.1f} > {ext_threshold:.1f} pts")
+
+        # Near primary Put Support Wall
+        put_wall = float(put_support_strike or 0.0)
+        put_unwinding = (short_covering_signal == "BEARISH_PUT_UNWINDING") or (atm_put_oi_change < 0)
+        if put_wall > 0 and abs(spot - put_wall) <= wall_dist_threshold and not put_unwinding:
+            is_near_oi_wall = True
+            ext_reasons.append(f"Spot {spot:.1f} within {wall_dist_threshold} pts of Put Wall {put_wall:.0f} without unwinding")
+
+    is_choppy = clean_trend in ("CHOPPY_SIDEWAYS", "FLAT")
+    action = "ALLOW"
+    block_trade = False
+    downgrade_to_scout = False
+    reason = ""
+
+    if is_overextended or is_near_oi_wall:
+        if is_choppy or is_near_oi_wall:
+            action = "BLOCK"
+            block_trade = True
+            reason = f"Anti-Chase Block: {', '.join(ext_reasons)} in {clean_trend}. Blocked entry."
+        else:
+            action = "DOWNGRADE"
+            downgrade_to_scout = True
+            reason = f"Anti-Chase Downgrade: {', '.join(ext_reasons)} in {clean_trend}. Downgraded to 1-Lot SCOUT_PROBE."
+
+    return {
+        "is_overextended": is_overextended,
+        "is_near_oi_wall": is_near_oi_wall,
+        "action": action,
+        "block_trade": block_trade,
+        "downgrade_to_scout": downgrade_to_scout,
+        "reason": reason,
+    }
 
 
 def evaluate_trade_opportunity(ticker: str, market_data_json: Dict[str, Any]) -> bool:
@@ -101,22 +209,52 @@ def evaluate_trade_opportunity(ticker: str, market_data_json: Dict[str, Any]) ->
 
     try:
         with Session(engine) as session:
-            today_total = count_today_trades(session)
-            today_ticker = count_today_trades(session, clean_ticker)
-            if today_total >= 4:
+            # Check maximum 1 concurrently OPEN position per symbol (UPGRADE 32)
+            open_pos = session.exec(
+                select(Position).where(
+                    Position.status == "OPEN",
+                    Position.ticker == clean_ticker,
+                )
+            ).first()
+            if open_pos:
                 logger.info(
-                    f"[GATEKEEPER] Anti-Churn Breaker: Daily session cap of 4 trades reached ({today_total}/4). Blocking scan."
+                    f"[GATEKEEPER] Active OPEN position #{open_pos.id} already exists for {clean_ticker}. "
+                    f"Maximum 1 concurrently OPEN position allowed per symbol. Blocking scan."
                 )
                 return False
-            if today_ticker >= 2:
+
+            today_total = count_today_trades(session)
+            today_ticker = count_today_trades(session, clean_ticker)
+            if today_total >= MAX_DAILY_TOTAL_TRADES:
                 logger.info(
-                    f"[GATEKEEPER] Anti-Churn Breaker: Daily cap of 2 trades for {clean_ticker} reached ({today_ticker}/2). Blocking scan."
+                    f"[GATEKEEPER] Anti-Churn Breaker: Daily session cap of {MAX_DAILY_TOTAL_TRADES} trades reached ({today_total}/{MAX_DAILY_TOTAL_TRADES}). Blocking scan."
+                )
+                return False
+            if today_ticker >= MAX_DAILY_SYMBOL_TRADES:
+                logger.info(
+                    f"[GATEKEEPER] Anti-Churn Breaker: Daily cap of {MAX_DAILY_SYMBOL_TRADES} trades for {clean_ticker} reached ({today_ticker}/{MAX_DAILY_SYMBOL_TRADES}). Blocking scan."
                 )
                 return False
     except Exception as exc:
         logger.warning(f"[GATEKEEPER] Failed checking daily trade count: {exc}")
 
-    spot = float(market_data_json.get("spot_price", 0.0))
+    # UPGRADE 50 Rule 2: Strict Triple-Confluence Entry Gate
+    from risk_manager import check_triple_confluence_entry_gate
+    bull_ok, bull_msg = check_triple_confluence_entry_gate(clean_ticker, "Bull Call Spread", market_data_json)
+    bear_ok, bear_msg = check_triple_confluence_entry_gate(clean_ticker, "Bear Put Spread", market_data_json)
+
+    if not bull_ok and not bear_ok:
+        logger.info(
+            f"[GATEKEEPER] {clean_ticker} evaluated as FLAT / NO_TRADE: Triple-confluence rules not met. "
+            f"(Bull: {bull_msg} | Bear: {bear_msg}). Skipping LLM to save quota."
+        )
+        return False
+
+    logger.info(
+        f"[GATEKEEPER] {clean_ticker} passed strict triple-confluence entry gate! "
+        f"(Bull: {bull_ok}, Bear: {bear_ok}). Proceeding to strategy formulation."
+    )
+    return True
     pcr = float(market_data_json.get("pcr", 1.0))
     volume_pcr = float(market_data_json.get("volume_pcr", 1.0))
     atm_put_oi_change = int(market_data_json.get("atm_put_oi_change", 0))
@@ -141,56 +279,99 @@ def evaluate_trade_opportunity(ticker: str, market_data_json: Dict[str, Any]) ->
     rsi_14 = float(intraday_technicals.get("rsi_14", 50.0))
 
     # -----------------------------------------------------------------------
-    # UPGRADE 5 GUARD 1: Hard Sideways Block & Afternoon Chop Guard (Post-14:00 IST)
+    # UPGRADE 32: Unblock Afternoon Trends & Streamlined Chop Gatekeeper
+    # - NEVER block when Trend is STRONG_UPTREND or STRONG_DOWNTREND.
+    # - REMOVE NEUTRAL_FLOW from rejection filter.
+    # - REMOVE 13:30 IST afternoon restriction (All-Day Training Mode).
+    # - ONLY block scans when Trend == "CHOPPY_SIDEWAYS" AND Efficiency Ratio ER < 0.35.
     # -----------------------------------------------------------------------
-    # Never allow directional debit spreads when Trend == CHOPPY_SIDEWAYS
-    if trend_state == "CHOPPY_SIDEWAYS":
-        logger.info(
-            f"[GATEKEEPER] {clean_ticker} trend is CHOPPY_SIDEWAYS. "
-            f"Blocking directional entry in choppy/neutral regime."
-        )
-        return False
+    raw_regime = (
+        market_data_json.get("regime")
+        or market_data_json.get("market_regime")
+        or market_data_json.get("trend_state")
+        or trend_state
+    )
+    regime = str(raw_regime).strip().upper() if raw_regime is not None else ""
 
-    # Block new directional entries after 14:00 IST unless ER >= 0.55 (STRONG_UPTREND or STRONG_DOWNTREND)
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    now_ist = datetime.now(timezone.utc).astimezone(ist_tz)
-    is_after_1400 = (now_ist.hour > 14) or (now_ist.hour == 14 and now_ist.minute >= 0)
+    is_strong_trend = (regime in ("STRONG_UPTREND", "STRONG_DOWNTREND")) or (trend_state in ("STRONG_UPTREND", "STRONG_DOWNTREND"))
 
-    if is_after_1400:
-        if efficiency_ratio < 0.55 or trend_state not in ("STRONG_UPTREND", "STRONG_DOWNTREND"):
+    # UPGRADE 40: Streamlined Chop Gatekeeper & Unblock SCOUT_PROBE
+    # Only reject at the Gatekeeper if Trend == "CHOPPY_SIDEWAYS" AND ER < 0.35 AND abs(5m_move) < 10.0 (NIFTY) / < 30.0 (BANKNIFTY).
+    # Whenever live price moves or OI flow is directional, pass the scan through to LangGraph.
+    min_chop_5m = 10.0 if clean_ticker == "NIFTY" else (30.0 if clean_ticker == "BANKNIFTY" else (spot * 0.0015))
+    is_directional_flow = (
+        (pcr >= 1.15)
+        or (pcr <= 0.85)
+        or (intraday_oi_pcr >= 1.25)
+        or (intraday_oi_pcr <= 0.80)
+        or (abs(move_5m_pts) >= min_chop_5m)
+    )
+
+    if not is_strong_trend and not is_directional_flow:
+        if (regime in ("CHOPPY_SIDEWAYS", "FLAT") or trend_state in ("CHOPPY_SIDEWAYS", "FLAT")) and efficiency_ratio < 0.35 and abs(move_5m_pts) < min_chop_5m:
             logger.info(
-                f"[GATEKEEPER] Afternoon Chop Guard: After 14:00 IST ({now_ist.strftime('%H:%M')} IST), "
-                f"directional entries require ER >= 0.55 and STRONG trend. Current ER={efficiency_ratio:.2f}, "
-                f"Trend={trend_state}. Blocking entry to prevent late-afternoon theta/whipsaw loss."
+                f"[GATEKEEPER] REJECTED: Choppy sideways regime detected ({regime or trend_state}) "
+                f"with low efficiency ratio (ER={efficiency_ratio:.2f} < 0.35) and low velocity (5m: {move_5m_pts:+.1f} pts < {min_chop_5m} pts) on {clean_ticker}. "
+                f"Directional scan blocked."
             )
             return False
 
     # -----------------------------------------------------------------------
-    # STEP 20 GUARD 1: Hard Chop Block (Kaufman Efficiency Ratio < 0.38)
+    # UPGRADE 31 GUARD 2: Strict Momentum & EMA Requirements (NIFTY & BANKNIFTY)
     # -----------------------------------------------------------------------
-    if is_choppy or efficiency_ratio < 0.38:
+    ema_9 = float(intraday_technicals.get("ema_9", market_data_json.get("ema_9", 0.0)) or 0.0)
+    ema_20 = float(intraday_technicals.get("ema_20", market_data_json.get("ema_20", 0.0)) or 0.0)
+    if clean_ticker in INDEX_SYMBOLS and ema_9 > 0 and ema_20 > 0:
+        ema_diff = abs(ema_9 - ema_20)
+        if ema_diff < 5.0 and not is_strong_trend and not is_directional_flow and abs(move_5m_pts) < min_chop_5m:
+            logger.info(
+                f"[GATEKEEPER] REJECTED: Weak EMA momentum on {clean_ticker}. "
+                f"Absolute difference between EMA 9 ({ema_9:.2f}) and EMA 20 ({ema_20:.2f}) is {ema_diff:.2f} pts (< 5.0 pts requirement). "
+                f"Directional scan blocked."
+            )
+            return False
+
+    if clean_ticker in INDEX_SYMBOLS and 47.0 <= rsi_14 <= 53.0 and not is_strong_trend and not is_directional_flow and abs(move_5m_pts) < min_chop_5m:
         logger.info(
-            f"[GATEKEEPER] {clean_ticker} is in CHOPPY WHIPSAW regime (ER={efficiency_ratio:.2f}). "
+            f"[GATEKEEPER] REJECTED: RSI ({rsi_14:.2f}) is in the neutral zone [47, 53] on {clean_ticker}. "
+            f"Directional scan blocked."
+        )
+        return False
+
+    # -----------------------------------------------------------------------
+    # STEP 20 GUARD 1: Hard Chop Block (Only if not strong trend, not directional flow, and ER < 0.35)
+    # -----------------------------------------------------------------------
+    if not is_strong_trend and not is_directional_flow and (is_choppy or efficiency_ratio < 0.35) and abs(move_5m_pts) < min_chop_5m:
+        logger.info(
+            f"[GATEKEEPER] {clean_ticker} is in CHOPPY WHIPSAW regime (ER={efficiency_ratio:.2f} < 0.35). "
             f"Blocking trade to prevent theta/whipsaw loss."
         )
         return False
 
     # -----------------------------------------------------------------------
-    # STEP 20 GUARD 2: Anti-Chasing Block (Overbought / Oversold exhaustion)
+    # STEP 20 & UPGRADE 39: Anti-Chase RSI/EMA Extension Filter & OI Support Check
     # -----------------------------------------------------------------------
-    if rsi_14 > 72.0 and (move_3m_pts > 0 or trend_state == "STRONG_UPTREND"):
-        logger.info(
-            f"[GATEKEEPER] {clean_ticker} RSI is OVERBOUGHT ({rsi_14:.1f} > 72). "
-            f"Blocking top-chasing entry."
-        )
+    anti_chase_res = check_anti_chase_extension(
+        ticker=clean_ticker,
+        strategy_or_bias=regime or trend_state,
+        spot=spot,
+        ema_9=ema_9,
+        rsi=rsi_14,
+        trend_state=regime or trend_state,
+        call_resistance_strike=call_resistance_strike,
+        put_support_strike=put_support_strike,
+        short_covering_signal=short_covering_signal,
+        atm_call_oi_change=atm_call_oi_change,
+        atm_put_oi_change=atm_put_oi_change,
+    )
+    if anti_chase_res["block_trade"]:
+        logger.info(f"[GATEKEEPER] {clean_ticker} {anti_chase_res['reason']}")
         return False
-
-    if rsi_14 < 28.0 and (move_3m_pts < 0 or trend_state == "STRONG_DOWNTREND"):
+    elif anti_chase_res["downgrade_to_scout"]:
         logger.info(
-            f"[GATEKEEPER] {clean_ticker} RSI is OVERSOLD ({rsi_14:.1f} < 28). "
-            f"Blocking bottom-chasing entry."
+            f"[GATEKEEPER] {clean_ticker} over-extended in confirmed trend. "
+            f"Permitting scan to proceed for 1-Lot SCOUT_PROBE downgrade."
         )
-        return False
 
     # -----------------------------------------------------------------------
     # STEP 20 GUARD 3: OI Alignment Check for Stock Options
@@ -324,10 +505,10 @@ def evaluate_trade_opportunity(ticker: str, market_data_json: Dict[str, Any]) ->
         return True
 
     if clean_ticker == "NIFTY":
-        if (abs(move_3m_pts) >= 15.0 or abs(move_5m_pts) >= 22.0) and efficiency_ratio >= 0.40:
+        if (abs(move_3m_pts) >= 15.0 or abs(move_5m_pts) >= 15.0) and efficiency_ratio >= 0.40:
             is_breakout = True
     elif clean_ticker == "BANKNIFTY":
-        if (abs(move_3m_pts) >= 35.0 or abs(move_5m_pts) >= 55.0) and efficiency_ratio >= 0.40:
+        if (abs(move_3m_pts) >= 35.0 or abs(move_5m_pts) >= 45.0) and efficiency_ratio >= 0.40:
             is_breakout = True
     else:
         # Equities
@@ -340,6 +521,8 @@ def evaluate_trade_opportunity(ticker: str, market_data_json: Dict[str, Any]) ->
         or consecutive_red >= 3
         or candle_range_expansion >= 2.2
         or abs(spot_delta_pct) >= 0.25
+        or (is_strong_trend and efficiency_ratio >= 0.40)
+        or (is_directional_flow and efficiency_ratio >= 0.40)
     ):
         is_breakout = True
 
@@ -354,8 +537,10 @@ def evaluate_trade_opportunity(ticker: str, market_data_json: Dict[str, Any]) ->
         fallback_triggered = (
             (abs(spot_delta_pct) >= 0.18)
             or (abs(move_5m_pct) >= 0.18)
-            or (pcr > 1.3)
-            or (pcr < 0.7)
+            or (pcr >= 1.15)
+            or (pcr <= 0.85)
+            or is_strong_trend
+            or is_directional_flow
             or (consecutive_green >= 2)
             or (consecutive_red >= 2)
         )

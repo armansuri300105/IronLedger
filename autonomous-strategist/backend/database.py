@@ -14,7 +14,12 @@ import os
 from datetime import datetime, timezone
 from typing import Generator, List, Optional
 
+from dotenv import load_dotenv
 from sqlmodel import Field, Session, SQLModel, create_engine, select
+
+dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(dotenv_path)
+load_dotenv()
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "paper_trader.db")
 DATABASE_URL = f"sqlite:///{DB_PATH}"
@@ -25,6 +30,13 @@ engine = create_engine(
     connect_args={"check_same_thread": False},
     echo=False,
 )
+
+# ---------------------------------------------------------------------------
+# Daily Trading Caps & Anti-Churn Limits (Central Configuration - UPGRADE 50)
+# ---------------------------------------------------------------------------
+# Institutional Blueprint Lock: Max 3 trades per symbol per day, max 6 total
+MAX_DAILY_TOTAL_TRADES: int = int(os.getenv("MAX_DAILY_TOTAL_TRADES", "6"))
+MAX_DAILY_SYMBOL_TRADES: int = int(os.getenv("MAX_DAILY_SYMBOL_TRADES", "3"))
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +67,12 @@ class Position(SQLModel, table=True):
     pnl: Optional[float] = Field(default=None, description="Final realized profit/loss in INR (Net PnL)")
     gross_pnl: Optional[float] = Field(default=None, description="Gross PnL before brokerage and charges")
     charges: Optional[float] = Field(default=0.0, description="Total Indian F&O brokerage and statutory taxes")
+    total_charges: Optional[float] = Field(default=0.0, description="Total Indian F&O charges (Upgrade 30)")
+    net_pnl: Optional[float] = Field(default=None, description="True Net Realized P&L (gross_pnl - total_charges, Upgrade 30)")
     status: str = Field(default="OPEN", index=True)  # OPEN, CLOSED_TARGET, CLOSED_SL, CLOSED_EXPIRY, CLOSED_MANUAL
     thesis: str = Field(default="", description="Quant Analyst original thesis")
+    conviction_tier: Optional[str] = Field(default="HIGH_CONVICTION", description="Conviction tier: HIGH_CONVICTION or SCOUT_PROBE (Upgrade 38)")
+    entry_spot: Optional[float] = Field(default=None, description="Underlying spot at order fill (Upgrade 41)")
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +89,31 @@ def init_db():
                 conn.exec_driver_sql("ALTER TABLE position ADD COLUMN gross_pnl FLOAT")
             if cols and "charges" not in cols:
                 conn.exec_driver_sql("ALTER TABLE position ADD COLUMN charges FLOAT DEFAULT 0.0")
+            if cols and "total_charges" not in cols:
+                conn.exec_driver_sql("ALTER TABLE position ADD COLUMN total_charges FLOAT DEFAULT 0.0")
+            if cols and "net_pnl" not in cols:
+                conn.exec_driver_sql("ALTER TABLE position ADD COLUMN net_pnl FLOAT")
+            if cols and "conviction_tier" not in cols:
+                conn.exec_driver_sql("ALTER TABLE position ADD COLUMN conviction_tier VARCHAR DEFAULT 'HIGH_CONVICTION'")
+            if cols and "entry_spot" not in cols:
+                conn.exec_driver_sql("ALTER TABLE position ADD COLUMN entry_spot FLOAT")
+
+            # UPGRADE 30: Backfill missing total_charges, net_pnl, and gross_pnl for existing positions
+            conn.exec_driver_sql("""
+                UPDATE position
+                SET total_charges = COALESCE(charges, 0.0)
+                WHERE total_charges IS NULL OR (total_charges = 0.0 AND charges > 0.0)
+            """)
+            conn.exec_driver_sql("""
+                UPDATE position
+                SET net_pnl = COALESCE(pnl, ROUND(COALESCE(gross_pnl, 0.0) - COALESCE(total_charges, 0.0), 2))
+                WHERE net_pnl IS NULL AND pnl IS NOT NULL
+            """)
+            conn.exec_driver_sql("""
+                UPDATE position
+                SET gross_pnl = COALESCE(gross_pnl, pnl)
+                WHERE gross_pnl IS NULL AND pnl IS NOT NULL
+            """)
             conn.commit()
     except Exception as exc:
         pass
@@ -125,6 +166,54 @@ def get_account(session: Session) -> Account:
         session.commit()
         session.refresh(account)
     return account
+
+
+def reset_paper_trading_db(engine_override=None):
+    """
+    UPGRADE 45: Factory Reset of Paper Trading Database & Zombie Positions.
+    Wipes all rows in the Position table (both OPEN and CLOSED_*) and resets Account to initial state:
+    - virtual_balance = 1000000.0 (Free Cash: ₹1,000,000.00)
+    - margin_used = 0.0
+    - realized_pnl = 0.0
+    """
+    target_engine = engine_override or engine
+    with Session(target_engine) as session:
+        positions = session.exec(select(Position)).all()
+        for p in positions:
+            session.delete(p)
+
+        account = session.exec(select(Account).where(Account.id == 1)).first()
+        if not account:
+            account = Account(id=1, virtual_balance=1000000.0, margin_used=0.0, realized_pnl=0.0)
+            session.add(account)
+        else:
+            account.virtual_balance = 1000000.0
+            account.margin_used = 0.0
+            account.realized_pnl = 0.0
+            session.add(account)
+        session.commit()
+
+    try:
+        import position_monitor
+        position_monitor.ENTRY_SPOT_CACHE.clear()
+        position_monitor.POSITION_TELEMETRY.clear()
+    except Exception:
+        pass
+
+    try:
+        import autopilot
+        autopilot.AUTOPILOT_STATE["exit_logs"] = []
+    except Exception:
+        pass
+
+    # Ensure paper_trading.db replica is also cleanly synchronized if disk engine was reset
+    if target_engine == engine and os.path.exists(DB_PATH):
+        try:
+            import shutil
+            alt_path = os.path.join(os.path.dirname(__file__), "paper_trading.db")
+            shutil.copyfile(DB_PATH, alt_path)
+        except Exception:
+            pass
 
 
 # Initialize tables and seed default account on module load
